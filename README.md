@@ -5,6 +5,12 @@
 Модель помнит предыдущие реплики разговора (в пределах окна контекста — 256 токенов,
 это примерно 2–3 короткие пары вопрос-ответ).
 
+## 💬 Поговорить с моделью с телефона
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/r0561952-beep/ai/blob/ccr-d2dd0252-6ksj1l/colab_chat.ipynb)
+
+Открой ссылку → нажимай ▶ у ячеек сверху вниз. Видеокарта не нужна.
+
 ## Что внутри
 
 | Файл | Что делает |
@@ -17,6 +23,7 @@
 | `chat.py` | чат с моделью |
 | `model/model.pt` | обученные веса |
 | `model/tokenizer.json` | обученный токенизатор |
+| `colab_chat.ipynb` | чат с моделью в Google Colab (с телефона) |
 | `colab_train.ipynb` | обучение на бесплатной видеокарте Google Colab |
 
 ## Данные
