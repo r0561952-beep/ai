@@ -69,7 +69,8 @@ val_data = np.fromfile(val_bin, dtype=np.uint16)
 print(f"токенов: обучение {len(train_data):,}, проверка {len(val_data):,}")
 
 # ---------- модель ----------
-full_ckpt = "checkpoints/full.pt"
+# полное состояние (с оптимизатором) для продолжения обучения
+full_ckpt = "checkpoints/full.pt" if args.out == "model/model.pt" else args.out + ".full"
 start_iter, best_val = 0, float("inf")
 if args.resume:
     src = full_ckpt if os.path.exists(full_ckpt) else args.out
@@ -106,10 +107,17 @@ def cpu_has_bf16():
 
 
 dev_type = "cuda" if args.device.startswith("cuda") else "cpu"
-use_bf16 = not args.no_bf16 and (dev_type == "cuda" or cpu_has_bf16())
-amp_ctx = torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_bf16)
+amp_dtype = None
+if not args.no_bf16:
+    if dev_type == "cuda":
+        # старые видеокарты (T4 в Colab) не умеют bf16 -> используем fp16
+        amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    elif cpu_has_bf16():
+        amp_dtype = torch.bfloat16
+amp_ctx = torch.autocast(dev_type, dtype=amp_dtype or torch.bfloat16, enabled=amp_dtype is not None)
+scaler = torch.amp.GradScaler(dev_type, enabled=amp_dtype == torch.float16)
 fwd = model if args.no_compile else torch.compile(model)
-print(f"bf16: {use_bf16}, compile: {not args.no_compile}")
+print(f"точность: {amp_dtype or 'fp32'}, compile: {not args.no_compile}")
 
 
 def get_batch(data):
@@ -184,9 +192,11 @@ for it in range(start_iter, args.max_iters + 1):
     with amp_ctx:
         _, loss = fwd(x, y)
     opt.zero_grad(set_to_none=True)
-    loss.backward()
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    opt.step()
+    scaler.step(opt)
+    scaler.update()
     if it % 50 == 0:
         dt = time.time() - t0
         done = it - start_iter + 1
