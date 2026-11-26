@@ -117,8 +117,9 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=40,
-                 repetition_penalty=1.15, stop_token=None):
+    def generate_stream(self, idx, max_new_tokens, temperature=0.8, top_k=40,
+                        repetition_penalty=1.15, stop_token=None):
+        """Выдаёт новые токены по одному (для «печатающегося» ответа в чате)."""
         for _ in range(max_new_tokens):
             ctx = idx[:, -self.cfg.block_size:]
             logits, _ = self(ctx)
@@ -134,6 +135,11 @@ class GPT(nn.Module):
                 logits[logits < v[:, [-1]]] = -float("inf")
             nxt = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
             idx = torch.cat([idx, nxt], dim=1)
+            yield nxt.item()
             if stop_token is not None and nxt.item() == stop_token:
                 break
-        return idx
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, **kw):
+        new = list(self.generate_stream(idx, max_new_tokens, **kw))
+        return torch.cat([idx, torch.tensor([new], dtype=idx.dtype, device=idx.device)], dim=1)

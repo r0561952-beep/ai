@@ -25,25 +25,40 @@ class ChatBot:
         self.fmt = ChatFormat(load_tokenizer())
         self.temperature, self.top_k, self.max_new_tokens = temperature, top_k, max_new_tokens
         self.budget = self.model.cfg.block_size - max_new_tokens  # место под историю
-        self.history = []  # закодированные реплики — «память» диалога
+        self.history = []  # реплики диалога — «память» (для answer)
 
     def reset(self):
         self.history.clear()
 
+    def build_prompt(self, messages):
+        """messages: [{"role": "user"/"assistant", "content": "..."}], последняя — вопрос.
+        Самые старые реплики выкидываются, если не влезают в окно контекста."""
+        turns = [self.fmt.encode_message("user" if m["role"] == "user" else "bot", m["content"])
+                 for m in messages]
+        while len(turns) > 1 and sum(map(len, turns)) + 1 > self.budget:
+            turns.pop(0)
+        return [t for turn in turns for t in turn][-self.budget + 1:] + [self.fmt.bot]
+
+    def stream(self, messages):
+        """Выдаёт растущий текст ответа по мере генерации."""
+        ids = self.build_prompt(messages)
+        reply = []
+        for t in self.model.generate_stream(torch.tensor([ids]), self.max_new_tokens,
+                                            temperature=self.temperature, top_k=self.top_k,
+                                            stop_token=self.fmt.end):
+            if t == self.fmt.end:
+                break
+            reply.append(t)
+            # недособранная буква (байты UTF-8) декодируется как «�» — не показываем её
+            yield self.fmt.decode(reply).rstrip("�").strip()
+
     def answer(self, question):
-        fmt = self.fmt
-        self.history.append(fmt.encode_message("user", question))
-        # убираем самые старые реплики, если не влезают в окно контекста
-        while len(self.history) > 1 and sum(map(len, self.history)) + 1 > self.budget:
-            self.history.pop(0)
-        ids = [t for turn in self.history for t in turn][-self.budget + 1:] + [fmt.bot]
-        out = self.model.generate(torch.tensor([ids]), self.max_new_tokens, temperature=self.temperature,
-                                  top_k=self.top_k, stop_token=fmt.end)
-        reply_ids = out[0, len(ids):].tolist()
-        if not reply_ids or reply_ids[-1] != fmt.end:
-            reply_ids.append(fmt.end)
-        self.history.append([fmt.bot] + reply_ids)
-        return fmt.decode(reply_ids).strip()
+        self.history.append({"role": "user", "content": question})
+        text = ""
+        for text in self.stream(self.history):
+            pass
+        self.history.append({"role": "assistant", "content": text})
+        return text
 
 
 def main():
