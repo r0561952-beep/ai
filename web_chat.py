@@ -65,7 +65,9 @@ def build_ui(bot=None):
     )
 
 
-def launch(share=False, port=7860, bot=None):
+def launch(share=False, port=None, bot=None):
+    """port=None — Gradio сам найдёт свободный порт (7860, 7861, ...)."""
+    gr.close_all()  # если чат уже запускали в этом же Colab — закрываем старый
     demo = build_ui(bot)
     demo.launch(share=share, server_port=port, theme=gr.themes.Soft(), css=CSS)
     return demo
@@ -74,6 +76,6 @@ def launch(share=False, port=7860, bot=None):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--share", action="store_true", help="публичная ссылка *.gradio.live")
-    p.add_argument("--port", type=int, default=7860)
+    p.add_argument("--port", type=int, default=None)
     a = p.parse_args()
     launch(share=a.share, port=a.port)
