@@ -17,6 +17,22 @@ class GPTConfig:
     dropout: float = 0.0
 
 
+def export_state(model, dtype=torch.float16):
+    """Веса для сохранения. head.weight не сохраняем — он совпадает с tok_emb.weight."""
+    return {k: v.detach().cpu().to(dtype) for k, v in model.state_dict().items() if k != "head.weight"}
+
+
+def load_model(path, device="cpu"):
+    """Загружает модель из model/model.pt или checkpoints/full.pt."""
+    ckpt = torch.load(path, map_location="cpu")
+    model = GPT(GPTConfig(**ckpt["config"]))
+    missing, unexpected = model.load_state_dict(
+        {k: v.float() for k, v in ckpt["model"].items()}, strict=False
+    )
+    assert set(missing) <= {"head.weight"} and not unexpected, (missing, unexpected)
+    return model.to(device), ckpt
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg):
         super().__init__()

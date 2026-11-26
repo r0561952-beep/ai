@@ -3,11 +3,12 @@
 Примеры:
   python train.py                          # маленькая модель, процессор
   python train.py --preset medium --device cuda   # побольше, на видеокарте (Colab/Kaggle)
-  python train.py --resume                 # продолжить с model/model.pt
+  python train.py --resume                 # продолжить с checkpoints/full.pt
 
 Сохраняет:
-  model/model.pt        — веса для чата (fp16, коммитится в репозиторий)
-  checkpoints/full.pt   — полное состояние для продолжения (локально, не коммитится)
+  checkpoints/full.pt   — каждые eval_every шагов: полное состояние для продолжения
+                          (папка checkpoints/ не коммитится)
+  model/model.pt        — в конце обучения: финальные веса для чата (fp16, коммитится)
 """
 import argparse
 import math
@@ -18,7 +19,7 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig, export_state, load_model
 from tokenizer_utils import TOKENIZER_PATH, ChatFormat, iter_dialogs, load_tokenizer, train_tokenizer
 
 PRESETS = {
@@ -42,7 +43,8 @@ p.add_argument("--eval_every", type=int, default=250)
 p.add_argument("--resume", action="store_true")
 p.add_argument("--no_bf16", action="store_true", help="не использовать bf16 (если процессор/GPU его не умеет)")
 p.add_argument("--no_compile", action="store_true", help="не использовать torch.compile")
-p.add_argument("--out", default="model/model.pt")
+p.add_argument("--out", default="model/model.pt", help="куда сохранить финальные веса")
+p.add_argument("--ckpt_dir", default="checkpoints", help="папка для промежуточных сохранений")
 args = p.parse_args()
 
 torch.manual_seed(1337)
@@ -55,8 +57,8 @@ if not os.path.exists(TOKENIZER_PATH):
 tok = load_tokenizer()
 fmt = ChatFormat(tok)
 
-os.makedirs("checkpoints", exist_ok=True)
-train_bin, val_bin = "checkpoints/train.bin", "checkpoints/val.bin"
+os.makedirs(args.ckpt_dir, exist_ok=True)
+train_bin, val_bin = os.path.join(args.ckpt_dir, "train.bin"), os.path.join(args.ckpt_dir, "val.bin")
 if not os.path.exists(train_bin):
     print("перевожу диалоги в токены ...")
     dialogs = list(iter_dialogs())
@@ -70,14 +72,12 @@ print(f"токенов: обучение {len(train_data):,}, проверка {
 
 # ---------- модель ----------
 # полное состояние (с оптимизатором) для продолжения обучения
-full_ckpt = "checkpoints/full.pt" if args.out == "model/model.pt" else args.out + ".full"
+full_ckpt = os.path.join(args.ckpt_dir, "full.pt")
 start_iter, best_val = 0, float("inf")
 if args.resume:
     src = full_ckpt if os.path.exists(full_ckpt) else args.out
-    ckpt = torch.load(src, map_location="cpu")
-    cfg = GPTConfig(**ckpt["config"])
-    model = GPT(cfg)
-    model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
+    model, ckpt = load_model(src)
+    cfg = model.cfg
     start_iter = ckpt.get("iter", 0)
     best_val = ckpt.get("val_loss", float("inf"))
     print(f"продолжаю с {src}, шаг {start_iter}")
@@ -148,12 +148,13 @@ def lr_at(it):
     return args.min_lr + 0.5 * (1 + math.cos(math.pi * frac)) * (args.lr - args.min_lr)
 
 
-def save(it, val_loss):
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+def save(it, val_loss, final=False):
     meta = {"config": asdict(cfg), "iter": it, "val_loss": val_loss}
-    torch.save({**meta, "model": {k: v.half() for k, v in state.items()}}, args.out)
-    torch.save({**meta, "model": state, "optimizer": opt.state_dict()}, full_ckpt)
+    torch.save({**meta, "model": export_state(model, torch.float32), "optimizer": opt.state_dict()}, full_ckpt)
+    if final:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        torch.save({**meta, "model": export_state(model)}, args.out)
+        print(f"финальные веса сохранены в {args.out}")
 
 
 @torch.no_grad()
@@ -177,13 +178,13 @@ for it in range(start_iter, args.max_iters + 1):
         if it > start_iter:
             if losses["val"] < best_val:
                 best_val = losses["val"]
-            save(it, losses["val"])
+            save(it, losses["val"], final=(it == args.max_iters))
             print("  пример ответа на «Что такое солнце?»:", sample().replace("\n", " ")[:200], flush=True)
     if it == args.max_iters:
         break
     if args.max_minutes and (time.time() - t0) / 60 > args.max_minutes:
         print("лимит времени — сохраняю и выхожу")
-        save(it, evaluate()["val"])
+        save(it, evaluate()["val"], final=True)
         break
 
     for g in opt.param_groups:

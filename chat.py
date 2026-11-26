@@ -9,20 +9,18 @@ import argparse
 
 import torch
 
-from model import GPT, GPTConfig
+from model import load_model
 from tokenizer_utils import ChatFormat, load_tokenizer
 
 p = argparse.ArgumentParser()
-p.add_argument("--model", default="model/model.pt")
+p.add_argument("--model", default="model/model.pt", help="или checkpoints/full.pt во время обучения")
 p.add_argument("-q", "--question")
 p.add_argument("--temperature", type=float, default=0.7)
 p.add_argument("--top_k", type=int, default=40)
 p.add_argument("--max_new_tokens", type=int, default=150)
 args = p.parse_args()
 
-ckpt = torch.load(args.model, map_location="cpu")
-model = GPT(GPTConfig(**ckpt["config"]))
-model.load_state_dict({k: v.float() for k, v in ckpt["model"].items()})
+model, ckpt = load_model(args.model)
 model.eval()
 fmt = ChatFormat(load_tokenizer())
 budget = model.cfg.block_size - args.max_new_tokens  # место под историю

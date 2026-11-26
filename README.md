@@ -38,7 +38,7 @@ python chat.py -q "Что такое фотосинтез?"
 Обучение:
 ```bash
 python train.py                                    # small, ~1 час на 4-ядерном процессоре
-python train.py --resume --max_iters 7000          # продолжить обучение
+python train.py --resume --max_iters 7000          # продолжить обучение (из checkpoints/full.pt)
 python train.py --preset medium --device cuda      # большая модель на видеокарте
 ```
 
