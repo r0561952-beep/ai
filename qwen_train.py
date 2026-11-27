@@ -176,12 +176,13 @@ def main():
         scaler.step(opt)
         scaler.update()
         opt.zero_grad(set_to_none=True)
-        loss_avg = total if loss_avg is None else 0.95 * loss_avg + 0.05 * total
+        if math.isfinite(total):  # редкий NaN в fp16 — шаг пропускает GradScaler, в среднее не берём
+            loss_avg = total if loss_avg is None else 0.95 * loss_avg + 0.05 * total
         el = (time.time() - t0) / 60
         done = step + 1
         if step % 10 == 0 or done == steps_total:
             left = el / (done - start) * (steps_total - done)
-            print(f"шаг {done}/{steps_total}: loss {loss_avg:.3f} | {seen / max(1e-6, el * 60):,.0f} ток/с | "
+            print(f"шаг {done}/{steps_total}: loss {loss_avg or float('nan'):.3f} | {seen / max(1e-6, el * 60):,.0f} ток/с | "
                   f"{el:.1f} мин, осталось ~{left:.0f} мин", flush=True)
         if done % args.save_every == 0 or done == steps_total:
             save(done)
