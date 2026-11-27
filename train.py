@@ -75,8 +75,11 @@ assert set(mix) <= set(SOURCES), f"неизвестный источник в --
 
 
 def encode_dialogs(dialogs, out_path, chunk=5000):
-    """Переводит диалоги в токены пачками (быстро и без лишней памяти)."""
-    with open(out_path, "wb") as f:
+    """Переводит диалоги в токены пачками (быстро и без лишней памяти).
+    Пишет во временный файл и переименовывает в конце — если процесс оборвётся,
+    недописанный файл не будет принят за готовый."""
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "wb") as f:
         for i in range(0, len(dialogs), chunk):
             part = dialogs[i:i + chunk]
             enc = tok.encode_batch([m["content"] for d in part for m in d])
@@ -86,6 +89,7 @@ def encode_dialogs(dialogs, out_path, chunk=5000):
                     ids += [fmt.user if m["role"] == "user" else fmt.bot] + enc[k].ids + [fmt.end]
                     k += 1
             np.array(ids, dtype=np.uint16).tofile(f)
+    os.replace(tmp_path, out_path)
 
 
 os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -111,14 +115,15 @@ mix_p = np.array([mix[n] for n in mix_names]) / sum(mix.values())
 # ---------- модель ----------
 # полное состояние (с оптимизатором) для продолжения обучения
 full_ckpt = os.path.join(args.ckpt_dir, "full.pt")
-start_iter, best_val = 0, float("inf")
+start_iter, best_val, prev_minutes = 0, float("inf"), 0.0
 if args.resume:
     src = full_ckpt if os.path.exists(full_ckpt) else args.out
     model, ckpt = load_model(src)
     cfg = model.cfg
     start_iter = ckpt.get("iter", 0)
     best_val = ckpt.get("val_loss", float("inf"))
-    print(f"продолжаю с {src}, шаг {start_iter}")
+    prev_minutes = float(ckpt.get("train_minutes", 0.0))  # сколько уже училась в прошлых запусках
+    print(f"продолжаю с {src}, шаг {start_iter}, уже обучалась {prev_minutes:.0f} мин")
 elif args.init_from:
     model, init = load_model(args.init_from)
     cfg = model.cfg
@@ -235,7 +240,8 @@ def lr_at(it):
 
 
 def save(it, val_loss, final=False):
-    meta = {"config": asdict(cfg), "iter": int(it), "val_loss": float(val_loss)}
+    meta = {"config": asdict(cfg), "iter": int(it), "val_loss": float(val_loss),
+            "train_minutes": (time.time() - t0) / 60}
     torch.save({**meta, "model": export_state(model, torch.float32), "optimizer": opt.state_dict()}, full_ckpt)
     if final:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -253,7 +259,9 @@ def sample(question="Что такое Солнце?"):
 
 
 # ---------- цикл обучения ----------
-t0 = time.time()
+# t0 учитывает время прошлых запусков: --max_minutes и --time_schedule считают общее время
+t_start = time.time()
+t0 = t_start - prev_minutes * 60
 tokens_per_step = args.batch_size * cfg.block_size
 it = start_iter
 for it in range(start_iter, args.max_iters + 1):
@@ -281,7 +289,7 @@ for it in range(start_iter, args.max_iters + 1):
     x, y = get_batch("train")
     loss = train_step(fwd, x, y)
     if it % 50 == 0:
-        dt = time.time() - t0
+        dt = time.time() - t_start
         done = it - start_iter + 1
         print(f"  шаг {it} loss {loss.item():.3f} | {done * tokens_per_step / dt:,.0f} ток/с", flush=True)
 

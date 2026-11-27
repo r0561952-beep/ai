@@ -53,6 +53,19 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
 
+    def forward_cached(self, x, past):
+        """Как forward, но с кэшем ключей/значений прошлых токенов (для быстрой генерации)."""
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+        q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v))
+        if past is not None:
+            k = torch.cat([past[0], k], dim=2)
+            v = torch.cat([past[1], v], dim=2)
+        # без кэша — обычная причинная маска; с кэшем новый токен видит всё прошлое
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=past is None)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y), (k, v)
+
 
 class MLP(nn.Module):
     def __init__(self, cfg):
@@ -76,6 +89,11 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
         return x + self.mlp(self.ln2(x))
+
+    def forward_cached(self, x, past):
+        a, kv = self.attn.forward_cached(self.ln1(x), past)
+        x = x + a
+        return x + self.mlp(self.ln2(x)), kv
 
 
 class GPT(nn.Module):
@@ -117,12 +135,32 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
+    def forward_cached(self, idx, cache, start_pos):
+        """Логиты для новых токенов idx, если первые start_pos токенов уже в кэше."""
+        pos = torch.arange(start_pos, start_pos + idx.size(1), device=idx.device)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
+        new_cache = []
+        for i, blk in enumerate(self.blocks):
+            x, kv = blk.forward_cached(x, cache[i] if cache else None)
+            new_cache.append(kv)
+        return self.head(self.ln_f(x)), new_cache
+
+    @torch.no_grad()
     def generate_stream(self, idx, max_new_tokens, temperature=0.8, top_k=40,
                         repetition_penalty=1.15, stop_token=None):
         """Выдаёт новые токены по одному (для «печатающегося» ответа в чате)."""
+        cache, cached = None, 0  # кэш: не пересчитываем уже обработанные токены
         for _ in range(max_new_tokens):
-            ctx = idx[:, -self.cfg.block_size:]
-            logits, _ = self(ctx)
+            if idx.size(1) > self.cfg.block_size:
+                # текст длиннее окна — позиции сдвигаются, кэш не годится: считаем заново
+                cache, cached = None, 0
+                ctx = idx[:, -self.cfg.block_size:]
+            else:
+                ctx = idx[:, cached:]
+            logits, cache = self.forward_cached(ctx, cache, cached)
+            cached = cached + ctx.size(1) if idx.size(1) <= self.cfg.block_size else 0
+            if cached == 0:
+                cache = None
             logits = logits[:, -1, :]
             if repetition_penalty != 1.0:
                 # штраф за повторы: понижаем вероятность уже использованных токенов
