@@ -28,7 +28,7 @@ PRESETS = {
     # ~ параметров без эмбеддингов: tiny ≈ 3M, small ≈ 11M, medium ≈ 42M
     "tiny":   dict(n_layer=4, n_head=4, n_embd=256, block_size=256),
     "small":  dict(n_layer=6, n_head=6, n_embd=384, block_size=256),
-    "medium": dict(n_layer=8, n_head=8, n_embd=640, block_size=512),
+    "medium": dict(n_layer=8, n_head=10, n_embd=640, block_size=512),
 }
 
 p = argparse.ArgumentParser()
@@ -45,10 +45,15 @@ p.add_argument("--eval_every", type=int, default=250)
 p.add_argument("--resume", action="store_true", help="продолжить прерванное обучение (тот же график lr)")
 p.add_argument("--init_from", help="начать новый цикл обучения с готовых весов, например model/model.pt")
 p.add_argument("--mix", default="qa=1", help="доли источников данных, например wiki=0.7,qa=0.3")
-p.add_argument("--no_bf16", action="store_true", help="не использовать bf16 (если процессор/GPU его не умеет)")
+p.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"],
+               help="auto: bf16 где умеет железо, fp16 на старых видеокартах (T4), иначе fp32")
+p.add_argument("--no_bf16", action="store_true", help="то же, что --precision fp32")
+p.add_argument("--time_schedule", action="store_true",
+               help="снижать скорость обучения по времени (--max_minutes), а не по числу шагов")
 p.add_argument("--no_compile", action="store_true", help="не использовать torch.compile")
 p.add_argument("--out", default="model/model.pt", help="куда сохранить финальные веса")
 p.add_argument("--ckpt_dir", default="checkpoints", help="папка для промежуточных сохранений")
+p.add_argument("--data_dir", help="папка для файлов с токенами (по умолчанию = ckpt_dir)")
 args = p.parse_args()
 
 torch.manual_seed(1337)
@@ -84,11 +89,13 @@ def encode_dialogs(dialogs, out_path, chunk=5000):
 
 
 os.makedirs(args.ckpt_dir, exist_ok=True)
+data_dir = args.data_dir or args.ckpt_dir
+os.makedirs(data_dir, exist_ok=True)
 data = {}
 for name in mix:
     path, prefix = SOURCES[name]
-    train_bin = os.path.join(args.ckpt_dir, prefix + "train.bin")
-    val_bin = os.path.join(args.ckpt_dir, prefix + "val.bin")
+    train_bin = os.path.join(data_dir, prefix + "train.bin")
+    val_bin = os.path.join(data_dir, prefix + "val.bin")
     if not os.path.exists(train_bin):
         print(f"перевожу {path} в токены ...")
         dialogs = list(iter_dialogs(path))
@@ -143,17 +150,46 @@ def cpu_has_bf16():
 
 
 dev_type = "cuda" if args.device.startswith("cuda") else "cpu"
-amp_dtype = None
-if not args.no_bf16:
+if dev_type == "cuda":
+    print("видеокарта:", torch.cuda.get_device_name(0))
+precision = "fp32" if args.no_bf16 else args.precision
+if precision == "auto":
     if dev_type == "cuda":
-        # старые видеокарты (T4 в Colab) не умеют bf16 -> используем fp16
-        amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-    elif cpu_has_bf16():
-        amp_dtype = torch.bfloat16
+        # старые видеокарты (T4 в Colab/Kaggle) не умеют bf16 -> fp16
+        precision = "bf16" if torch.cuda.get_device_capability()[0] >= 8 else "fp16"
+    else:
+        precision = "bf16" if cpu_has_bf16() else "fp32"
+amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[precision]
 amp_ctx = torch.autocast(dev_type, dtype=amp_dtype or torch.bfloat16, enabled=amp_dtype is not None)
 scaler = torch.amp.GradScaler(dev_type, enabled=amp_dtype == torch.float16)
-fwd = model if args.no_compile else torch.compile(model)
-print(f"точность: {amp_dtype or 'fp32'}, compile: {not args.no_compile}")
+
+
+def train_step(fn, x, y):
+    with amp_ctx:
+        _, loss = fn(x, y)
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(opt)
+    scaler.update()
+    return loss
+
+
+fwd = model
+if not args.no_compile:
+    # torch.compile ускоряет, но не везде работает — проверяем на пробном шаге (с lr=0)
+    try:
+        compiled = torch.compile(model)
+        for g in opt.param_groups:
+            g["lr"] = 0.0
+        xb = torch.zeros((args.batch_size, cfg.block_size), dtype=torch.long, device=args.device)
+        train_step(compiled, xb, xb)
+        fwd = compiled
+    except Exception as e:  # noqa: BLE001
+        print(f"torch.compile не заработал ({type(e).__name__}: {str(e)[:200]}) — учусь без него")
+        opt.zero_grad(set_to_none=True)
+print(f"точность: {precision}, compile: {fwd is not model}")
 
 
 def get_batch(split, source=None):
@@ -193,6 +229,8 @@ def lr_at(it):
     if it < args.warmup:
         return args.lr * (it + 1) / args.warmup
     frac = min(1.0, (it - args.warmup) / max(1, args.max_iters - args.warmup))
+    if args.time_schedule and args.max_minutes:
+        frac = max(frac, min(1.0, (time.time() - t0) / 60 / args.max_minutes))
     return args.min_lr + 0.5 * (1 + math.cos(math.pi * frac)) * (args.lr - args.min_lr)
 
 
@@ -241,14 +279,7 @@ for it in range(start_iter, args.max_iters + 1):
     for g in opt.param_groups:
         g["lr"] = lr_at(it)
     x, y = get_batch("train")
-    with amp_ctx:
-        _, loss = fwd(x, y)
-    opt.zero_grad(set_to_none=True)
-    scaler.scale(loss).backward()
-    scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    scaler.step(opt)
-    scaler.update()
+    loss = train_step(fwd, x, y)
     if it % 50 == 0:
         dt = time.time() - t0
         done = it - start_iter + 1
