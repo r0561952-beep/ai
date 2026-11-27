@@ -4,6 +4,8 @@
   python train.py                          # маленькая модель, процессор
   python train.py --preset medium --device cuda   # побольше, на видеокарте (Colab/Kaggle)
   python train.py --resume                 # продолжить с checkpoints/full.pt
+  python train.py --init_from model/model.pt --mix wiki=0.7,qa=0.3 --lr 6e-4
+                                           # дообучить готовую модель на Википедии + диалогах
 
 Сохраняет:
   checkpoints/full.pt   — каждые eval_every шагов: полное состояние для продолжения
@@ -40,7 +42,9 @@ p.add_argument("--min_lr", type=float, default=1e-4)
 p.add_argument("--warmup", type=int, default=200)
 p.add_argument("--dropout", type=float, default=0.0)
 p.add_argument("--eval_every", type=int, default=250)
-p.add_argument("--resume", action="store_true")
+p.add_argument("--resume", action="store_true", help="продолжить прерванное обучение (тот же график lr)")
+p.add_argument("--init_from", help="начать новый цикл обучения с готовых весов, например model/model.pt")
+p.add_argument("--mix", default="qa=1", help="доли источников данных, например wiki=0.7,qa=0.3")
 p.add_argument("--no_bf16", action="store_true", help="не использовать bf16 (если процессор/GPU его не умеет)")
 p.add_argument("--no_compile", action="store_true", help="не использовать torch.compile")
 p.add_argument("--out", default="model/model.pt", help="куда сохранить финальные веса")
@@ -57,18 +61,45 @@ if not os.path.exists(TOKENIZER_PATH):
 tok = load_tokenizer()
 fmt = ChatFormat(tok)
 
+SOURCES = {  # имя -> (файл с диалогами, префикс файлов с токенами)
+    "qa": ("data/qa_ru.jsonl.gz", ""),               # python prepare_data.py
+    "wiki": ("data/wiki_qa_ru.jsonl.gz", "wiki_"),   # python prepare_wiki.py
+}
+mix = {k: float(v) for k, v in (x.split("=") for x in args.mix.split(","))}
+assert set(mix) <= set(SOURCES), f"неизвестный источник в --mix: {set(mix) - set(SOURCES)}"
+
+
+def encode_dialogs(dialogs, out_path, chunk=5000):
+    """Переводит диалоги в токены пачками (быстро и без лишней памяти)."""
+    with open(out_path, "wb") as f:
+        for i in range(0, len(dialogs), chunk):
+            part = dialogs[i:i + chunk]
+            enc = tok.encode_batch([m["content"] for d in part for m in d])
+            ids, k = [], 0
+            for d in part:
+                for m in d:
+                    ids += [fmt.user if m["role"] == "user" else fmt.bot] + enc[k].ids + [fmt.end]
+                    k += 1
+            np.array(ids, dtype=np.uint16).tofile(f)
+
+
 os.makedirs(args.ckpt_dir, exist_ok=True)
-train_bin, val_bin = os.path.join(args.ckpt_dir, "train.bin"), os.path.join(args.ckpt_dir, "val.bin")
-if not os.path.exists(train_bin):
-    print("перевожу диалоги в токены ...")
-    dialogs = list(iter_dialogs())
-    n_val = max(500, len(dialogs) // 50)
-    for path, part in ((val_bin, dialogs[:n_val]), (train_bin, dialogs[n_val:])):
-        ids = [t for d in part for t in fmt.encode_dialog(d)]
-        np.array(ids, dtype=np.uint16).tofile(path)
-train_data = np.fromfile(train_bin, dtype=np.uint16)
-val_data = np.fromfile(val_bin, dtype=np.uint16)
-print(f"токенов: обучение {len(train_data):,}, проверка {len(val_data):,}")
+data = {}
+for name in mix:
+    path, prefix = SOURCES[name]
+    train_bin = os.path.join(args.ckpt_dir, prefix + "train.bin")
+    val_bin = os.path.join(args.ckpt_dir, prefix + "val.bin")
+    if not os.path.exists(train_bin):
+        print(f"перевожу {path} в токены ...")
+        dialogs = list(iter_dialogs(path))
+        n_val = max(500, len(dialogs) // 50)
+        encode_dialogs(dialogs[:n_val], val_bin)
+        encode_dialogs(dialogs[n_val:], train_bin)
+    data[name] = {"train": np.fromfile(train_bin, dtype=np.uint16), "val": np.fromfile(val_bin, dtype=np.uint16)}
+    print(f"{name}: доля {mix[name]}, токенов: обучение {len(data[name]['train']):,}, "
+          f"проверка {len(data[name]['val']):,}")
+mix_names = list(mix)
+mix_p = np.array([mix[n] for n in mix_names]) / sum(mix.values())
 
 # ---------- модель ----------
 # полное состояние (с оптимизатором) для продолжения обучения
@@ -81,6 +112,11 @@ if args.resume:
     start_iter = ckpt.get("iter", 0)
     best_val = ckpt.get("val_loss", float("inf"))
     print(f"продолжаю с {src}, шаг {start_iter}")
+elif args.init_from:
+    model, init = load_model(args.init_from)
+    cfg = model.cfg
+    ckpt = None
+    print(f"начинаю новый цикл обучения с весов {args.init_from} (их шаг {init.get('iter')})")
 else:
     cfg = GPTConfig(vocab_size=tok.get_vocab_size(), dropout=args.dropout, **PRESETS[args.preset])
     model = GPT(cfg)
@@ -120,23 +156,35 @@ fwd = model if args.no_compile else torch.compile(model)
 print(f"точность: {amp_dtype or 'fp32'}, compile: {not args.no_compile}")
 
 
-def get_batch(data):
-    ix = np.random.randint(0, len(data) - cfg.block_size - 1, args.batch_size)
-    x = torch.from_numpy(np.stack([data[i:i + cfg.block_size] for i in ix]).astype(np.int64))
-    y = torch.from_numpy(np.stack([data[i + 1:i + 1 + cfg.block_size] for i in ix]).astype(np.int64))
+def get_batch(split, source=None):
+    """Каждая строка батча берётся из источника, выбранного по долям --mix."""
+    srcs = [source] * args.batch_size if source else np.random.choice(mix_names, args.batch_size, p=mix_p)
+    xs, ys = [], []
+    for s in srcs:
+        arr = data[s][split]
+        i = np.random.randint(0, len(arr) - cfg.block_size - 1)
+        xs.append(arr[i:i + cfg.block_size])
+        ys.append(arr[i + 1:i + 1 + cfg.block_size])
+    x = torch.from_numpy(np.stack(xs).astype(np.int64))
+    y = torch.from_numpy(np.stack(ys).astype(np.int64))
     return x.to(args.device), y.to(args.device)
 
 
 @torch.no_grad()
 def evaluate(iters=20):
+    """Ошибка по каждому источнику и общая (взвешенная по долям)."""
     model.eval()
     out = {}
-    for name, data in (("train", train_data), ("val", val_data)):
-        losses = []
-        for _ in range(iters):
-            with amp_ctx:
-                losses.append(fwd(*get_batch(data))[1].item())
-        out[name] = sum(losses) / len(losses)
+    for split in ("train", "val"):
+        total = 0.0
+        for name, w in zip(mix_names, mix_p):
+            losses = []
+            for _ in range(max(4, int(iters * w))):
+                with amp_ctx:
+                    losses.append(fwd(*get_batch(split, name))[1].item())
+            out[f"{split}_{name}"] = sum(losses) / len(losses)
+            total += w * out[f"{split}_{name}"]
+        out[split] = total
     model.train()
     return out
 
@@ -158,7 +206,7 @@ def save(it, val_loss, final=False):
 
 
 @torch.no_grad()
-def sample(question="Что такое солнце?"):
+def sample(question="Что такое Солнце?"):
     model.eval()
     ids = fmt.encode_message("user", question) + [fmt.bot]
     out = model.generate(torch.tensor([ids], device=args.device), 80, stop_token=fmt.end)
@@ -174,12 +222,15 @@ for it in range(start_iter, args.max_iters + 1):
     if it % args.eval_every == 0 or it == args.max_iters:
         losses = evaluate()
         el = (time.time() - t0) / 60
-        print(f"шаг {it}: train {losses['train']:.3f}, val {losses['val']:.3f}  ({el:.1f} мин)", flush=True)
+        parts = ", ".join(f"{n} {losses['val_' + n]:.3f}" for n in mix_names) if len(mix_names) > 1 else ""
+        print(f"шаг {it}: train {losses['train']:.3f}, val {losses['val']:.3f}"
+              f"{' (' + parts + ')' if parts else ''}  ({el:.1f} мин)", flush=True)
         if it > start_iter:
             if losses["val"] < best_val:
                 best_val = losses["val"]
             save(it, losses["val"], final=(it == args.max_iters))
-            print("  пример ответа на «Что такое солнце?»:", sample().replace("\n", " ")[:200], flush=True)
+            for q in ("Что такое Солнце?", "Как приготовить блины?"):
+                print(f"  пример ответа на «{q}»:", sample(q).replace("\n", " ")[:200], flush=True)
     if it == args.max_iters:
         break
     if args.max_minutes and (time.time() - t0) / 60 > args.max_minutes:
@@ -189,7 +240,7 @@ for it in range(start_iter, args.max_iters + 1):
 
     for g in opt.param_groups:
         g["lr"] = lr_at(it)
-    x, y = get_batch(train_data)
+    x, y = get_batch("train")
     with amp_ctx:
         _, loss = fwd(x, y)
     opt.zero_grad(set_to_none=True)
