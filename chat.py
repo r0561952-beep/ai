@@ -31,6 +31,10 @@ class ChatBot:
         self.budget = self.model.cfg.block_size - max_new_tokens  # место под историю
         self.history = []  # реплики диалога — «память» (для answer)
 
+    def configure(self, temperature, max_new_tokens):
+        self.temperature, self.max_new_tokens = temperature, int(max_new_tokens)
+        self.budget = self.model.cfg.block_size - self.max_new_tokens
+
     def reset(self):
         self.history.clear()
 

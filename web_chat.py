@@ -45,8 +45,7 @@ def build_ui(bot=None):
     bot = bot or ChatBot()
 
     def respond(message, history, name, persona, scenario, temperature, max_tokens):
-        bot.temperature, bot.max_new_tokens = temperature, int(max_tokens)
-        bot.budget = bot.model.cfg.block_size - bot.max_new_tokens
+        bot.configure(temperature, max_tokens)
         card = make_card(name, persona, scenario) if (name or persona or scenario).strip() else None
         messages = [{"role": m["role"], "content": _text(m["content"])} for m in history]
         messages.append({"role": "user", "content": _text(message)})
@@ -77,9 +76,13 @@ def build_ui(bot=None):
     )
 
 
-def launch(share=False, port=None, bot=None, model="model/model.pt"):
-    """port=None — Gradio сам найдёт свободный порт (7860, 7861, ...)."""
+def launch(share=False, port=None, bot=None, model="model/model.pt", qwen_adapter=None):
+    """port=None — Gradio сам найдёт свободный порт (7860, 7861, ...).
+    qwen_adapter — путь к адаптеру Qwen (тогда вместо нашей модели — Qwen, нужна видеокарта)."""
     gr.close_all()  # если чат уже запускали в этом же Colab — закрываем старый
+    if bot is None and qwen_adapter:
+        from qwen_chat import QwenBot
+        bot = QwenBot(qwen_adapter)
     demo = build_ui(bot or ChatBot(model))
     demo.launch(share=share, server_port=port, theme=gr.themes.Soft(), css=CSS)
     return demo
@@ -90,5 +93,6 @@ if __name__ == "__main__":
     p.add_argument("--share", action="store_true", help="публичная ссылка *.gradio.live")
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--model", default="model/model.pt", help="например model/model_rp.pt — ролевая модель")
+    p.add_argument("--qwen", help="папка адаптера Qwen (из qwen_train.py) — чат с Qwen вместо нашей модели")
     a = p.parse_args()
-    launch(share=a.share, port=a.port, model=a.model)
+    launch(share=a.share, port=a.port, model=a.model, qwen_adapter=a.qwen)
