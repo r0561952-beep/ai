@@ -46,6 +46,7 @@ class QwenBot:
         self.stop_ids = [self.tok.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
         self.history = []
         self.ckpt = {"iter": "Qwen" + (" + ролевой адаптер" if adapter else "")}
+        self.label = base.rsplit("/", 1)[-1] + (" + наш ролевой адаптер" if adapter else " (БЕЗ ролевого дообучения)")
 
     def configure(self, temperature, max_new_tokens):
         self.temperature, self.max_new_tokens = temperature, int(max_new_tokens)

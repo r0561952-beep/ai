@@ -30,6 +30,8 @@ class ChatBot:
         self.temperature, self.top_k, self.max_new_tokens = temperature, top_k, max_new_tokens
         self.budget = self.model.cfg.block_size - max_new_tokens  # место под историю
         self.history = []  # реплики диалога — «память» (для answer)
+        n = self.model.num_params() / 1e6
+        self.label = f"своя модель {model_path.rsplit('/', 1)[-1]} ({n:.0f} млн параметров)"
 
     def configure(self, temperature, max_new_tokens):
         self.temperature, self.max_new_tokens = temperature, int(max_new_tokens)

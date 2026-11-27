@@ -58,7 +58,7 @@ def build_ui(bot=None):
     return gr.ChatInterface(
         respond,
         title=TITLE,
-        description=DESCRIPTION,
+        description=f"**🧠 Модель: {getattr(bot, 'label', '?')}**\n\n" + DESCRIPTION,
         examples=[[e] for e in EXAMPLES],
         chatbot=gr.Chatbot(placeholder="### Начни игру 🎭", height="65vh", show_label=False),
         textbox=gr.Textbox(placeholder="Напиши реплику… *действия — в звёздочках*", submit_btn=True, stop_btn=True),
