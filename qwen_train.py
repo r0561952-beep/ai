@@ -35,6 +35,8 @@ p.add_argument("--max_minutes", type=float, default=0, help="остановит�
 p.add_argument("--run_minutes", type=float, default=0, help="остановить ЭТОТ запуск через N минут (продолжить — запуском снова)")
 p.add_argument("--save_every", type=int, default=50, help="сохранять прогресс каждые N шагов")
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+p.add_argument("--no_grad_ckpt", action="store_true",
+               help="не пересчитывать активации (быстрее на ~30%, но нужно больше памяти)")
 args = p.parse_args()
 
 SYSTEM_DEFAULT = "Ты — живой собеседник в ролевой игре. Отвечай от лица своего персонажа."
@@ -128,16 +130,22 @@ def main():
     # fp16 на T4 (bf16 там нет); сама модель заморожена, учатся только веса LoRA (в fp32)
     dtype = amp or torch.float32
     model = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(args.device)
-    model.gradient_checkpointing_enable()
+    if not args.no_grad_ckpt:
+        model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
     model.config.use_cache = False
     if os.path.exists(adapter_dir):
         model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
         print("продолжаю с сохранённого адаптера")
     else:
-        cfg = LoraConfig(r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.05, task_type="CAUSAL_LM",
+        cfg = LoraConfig(r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.0, task_type="CAUSAL_LM",
                          target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
         model = get_peft_model(model, cfg)
+    # dropout в LoRA выключаем: на процессоре он съедал ~половину времени, а пользы почти не даёт
+    for module in model.modules():
+        if hasattr(module, "lora_dropout"):
+            for key in list(module.lora_dropout.keys()):
+                module.lora_dropout[key] = torch.nn.Identity()
     for prm in model.parameters():
         if prm.requires_grad:
             prm.data = prm.data.float()
