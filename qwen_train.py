@@ -84,8 +84,15 @@ def load_examples(tok):
 
 
 def batches(examples, pad_id):
-    for i in range(0, len(examples), args.batch_size):
-        part = examples[i:i + args.batch_size]
+    """Пачки из примеров похожей длины: меньше «пустых» токенов-заполнителей — обучение
+    в ~2 раза быстрее. Порядок пачек перемешан, но всегда одинаков (продолжение после обрыва)."""
+    chunk = args.batch_size * 64
+    order = []
+    for i in range(0, len(examples), chunk):
+        block = sorted(examples[i:i + chunk], key=lambda x: len(x[0]))
+        order += [block[j:j + args.batch_size] for j in range(0, len(block), args.batch_size)]
+    random.Random(1).shuffle(order)
+    for part in order:
         L = max(len(x[0]) for x in part)
         ids = torch.full((len(part), L), pad_id)
         lab = torch.full((len(part), L), -100)
@@ -174,8 +181,9 @@ def main():
         total = 0.0
         for ids, lab, att in groups[step]:
             with torch.autocast("cuda" if cuda else "cpu", dtype=amp or torch.float32, enabled=amp is not None):
-                out = model(input_ids=ids.to(args.device), attention_mask=att.to(args.device),
-                            labels=lab.to(args.device))
+                # маску не передаём: заполнитель стоит в конце, а модель смотрит только назад —
+                # настоящие токены его не видят. Без маски внимание считается быстрым путём.
+                out = model(input_ids=ids.to(args.device), labels=lab.to(args.device))
             loss = out.loss / len(groups[step])
             scaler.scale(loss).backward()
             total += loss.item()
