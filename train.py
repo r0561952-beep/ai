@@ -41,6 +41,7 @@ p.add_argument("--lr", type=float, default=1e-3)
 p.add_argument("--min_lr", type=float, default=1e-4)
 p.add_argument("--warmup", type=int, default=200)
 p.add_argument("--dropout", type=float, default=0.0)
+p.add_argument("--block_size", type=int, help="расширить окно контекста модели (например 512) при --init_from")
 p.add_argument("--eval_every", type=int, default=250)
 p.add_argument("--resume", action="store_true", help="продолжить прерванное обучение (тот же график lr)")
 p.add_argument("--init_from", help="начать новый цикл обучения с готовых весов, например model/model.pt")
@@ -69,6 +70,8 @@ fmt = ChatFormat(tok)
 SOURCES = {  # имя -> (файл с диалогами, префикс файлов с токенами)
     "qa": ("data/qa_ru.jsonl.gz", ""),               # python prepare_data.py
     "wiki": ("data/wiki_qa_ru.jsonl.gz", "wiki_"),   # python prepare_wiki.py
+    "rp": ("data/rp_ru.jsonl.gz", "rp_"),             # python prepare_rp.py (ролевые диалоги)
+    "rp18": ("data/rp18_ru.jsonl.gz", "rp18_"),       # python prepare_rp.py (18+ ролевые диалоги)
 }
 mix = {k: float(v) for k, v in (x.split("=") for x in args.mix.split(","))}
 assert set(mix) <= set(SOURCES), f"неизвестный источник в --mix: {set(mix) - set(SOURCES)}"
@@ -79,16 +82,20 @@ def encode_dialogs(dialogs, out_path, chunk=5000):
     Пишет во временный файл и переименовывает в конце — если процесс оборвётся,
     недописанный файл не будет принят за готовый."""
     tmp_path = out_path + ".tmp"
+    starts, pos = [], 0  # где начинается каждый диалог — для выборки «с начала диалога»
     with open(tmp_path, "wb") as f:
         for i in range(0, len(dialogs), chunk):
             part = dialogs[i:i + chunk]
             enc = tok.encode_batch([m["content"] for d in part for m in d])
             ids, k = [], 0
             for d in part:
+                starts.append(pos + len(ids))
                 for m in d:
                     ids += [fmt.user if m["role"] == "user" else fmt.bot] + enc[k].ids + [fmt.end]
                     k += 1
             np.array(ids, dtype=np.uint16).tofile(f)
+            pos += len(ids)
+    np.array(starts, dtype=np.int64).tofile(out_path[:-4] + ".idx")
     os.replace(tmp_path, out_path)
 
 
@@ -107,6 +114,10 @@ for name in mix:
         encode_dialogs(dialogs[:n_val], val_bin)
         encode_dialogs(dialogs[n_val:], train_bin)
     data[name] = {"train": np.fromfile(train_bin, dtype=np.uint16), "val": np.fromfile(val_bin, dtype=np.uint16)}
+    for split, path in (("train", train_bin), ("val", val_bin)):
+        idx = path[:-4] + ".idx"
+        if os.path.exists(idx):  # окна начинаются с начала диалога (с карточки персонажа)
+            data[name][split + "_starts"] = np.fromfile(idx, dtype=np.int64)
     print(f"{name}: доля {mix[name]}, токенов: обучение {len(data[name]['train']):,}, "
           f"проверка {len(data[name]['val']):,}")
 mix_names = list(mix)
@@ -129,6 +140,15 @@ elif args.init_from:
     cfg = model.cfg
     ckpt = None
     print(f"начинаю новый цикл обучения с весов {args.init_from} (их шаг {init.get('iter')})")
+    if args.block_size and args.block_size > cfg.block_size:
+        # растягиваем позиционные эмбеддинги на новое окно (линейная интерполяция), дальше модель доучится
+        old = model.pos_emb.weight.data  # (T, C)
+        new = torch.nn.functional.interpolate(old.T[None], size=args.block_size, mode="linear",
+                                              align_corners=True)[0].T.contiguous()
+        model.pos_emb = torch.nn.Embedding(args.block_size, old.size(1))
+        model.pos_emb.weight.data.copy_(new)
+        print(f"окно контекста расширено: {cfg.block_size} → {args.block_size} токенов")
+        cfg.block_size = args.block_size
 else:
     cfg = GPTConfig(vocab_size=tok.get_vocab_size(), dropout=args.dropout, **PRESETS[args.preset])
     model = GPT(cfg)
@@ -203,7 +223,12 @@ def get_batch(split, source=None):
     xs, ys = [], []
     for s in srcs:
         arr = data[s][split]
-        i = np.random.randint(0, len(arr) - cfg.block_size - 1)
+        starts = data[s].get(split + "_starts")
+        i = -1
+        if starts is not None:
+            i = int(starts[np.random.randint(len(starts))])
+        if not 0 <= i < len(arr) - cfg.block_size - 1:
+            i = np.random.randint(0, len(arr) - cfg.block_size - 1)
         xs.append(arr[i:i + cfg.block_size])
         ys.append(arr[i + 1:i + 1 + cfg.block_size])
     x = torch.from_numpy(np.stack(xs).astype(np.int64))
@@ -249,10 +274,14 @@ def save(it, val_loss, final=False):
         print(f"финальные веса сохранены в {args.out}")
 
 
+SAMPLE_CARD = ("[Ролевая игра]\nПерсонаж: Лира\nОписание: Насмешливая и смелая эльфийка-следопыт из Северного леса. "
+               "Метко стреляет из лука, обожает загадки.\nСценарий: Таверна на перекрёстке дорог, вечер, за окном гроза.")
+
+
 @torch.no_grad()
-def sample(question="Что такое Солнце?"):
+def sample(question="Что такое Солнце?", card=None):
     model.eval()
-    ids = fmt.encode_message("user", question) + [fmt.bot]
+    ids = (fmt.encode_message("user", card) if card else []) + fmt.encode_message("user", question) + [fmt.bot]
     out = model.generate(torch.tensor([ids], device=args.device), 80, stop_token=fmt.end)
     model.train()
     return fmt.decode(out[0, len(ids):].tolist())
@@ -277,6 +306,9 @@ for it in range(start_iter, args.max_iters + 1):
             save(it, losses["val"], final=(it == args.max_iters))
             for q in ("Что такое Солнце?", "Как приготовить блины?"):
                 print(f"  пример ответа на «{q}»:", sample(q).replace("\n", " ")[:200], flush=True)
+            if any(n.startswith("rp") for n in mix_names):
+                q = "*стряхивает капли дождя с плаща* Привет! Можно присесть рядом?"
+                print(f"  ролевая игра (Лира) на «{q}»:", sample(q, SAMPLE_CARD).replace("\n", " ")[:250], flush=True)
     if it == args.max_iters:
         break
     if args.max_minutes and (time.time() - t0) / 60 > args.max_minutes:

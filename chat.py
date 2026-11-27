@@ -3,6 +3,8 @@
 
   python chat.py                       # интерактивный чат
   python chat.py -q "Что такое луна?"  # один вопрос
+  python chat.py --name "Лира" --persona "Насмешливая эльфийка-следопыт" --scenario "Таверна, вечер"
+                                       # ролевая игра с персонажем
 Команды в чате: /new — забыть диалог, /exit — выйти.
 
 Из Python / Colab:
@@ -15,6 +17,8 @@ import argparse
 import torch
 
 from model import load_model
+from rp_card import make_card
+from safety import REFUSAL, blocked
 from tokenizer_utils import ChatFormat, load_tokenizer
 
 
@@ -30,18 +34,25 @@ class ChatBot:
     def reset(self):
         self.history.clear()
 
-    def build_prompt(self, messages):
+    def build_prompt(self, messages, card=None):
         """messages: [{"role": "user"/"assistant", "content": "..."}], последняя — вопрос.
-        Самые старые реплики выкидываются, если не влезают в окно контекста."""
+        card — карточка персонажа: всегда остаётся в начале, а самые старые реплики
+        выкидываются, если не влезают в окно контекста."""
+        pinned = self.fmt.encode_message("user", card) if card else []
         turns = [self.fmt.encode_message("user" if m["role"] == "user" else "bot", m["content"])
                  for m in messages]
-        while len(turns) > 1 and sum(map(len, turns)) + 1 > self.budget:
+        while len(turns) > 1 and len(pinned) + sum(map(len, turns)) + 1 > self.budget:
             turns.pop(0)
-        return [t for turn in turns for t in turn][-self.budget + 1:] + [self.fmt.bot]
+        body = [t for turn in turns for t in turn][-max(1, self.budget - len(pinned) - 1):]
+        return pinned + body + [self.fmt.bot]
 
-    def stream(self, messages):
+    def stream(self, messages, card=None):
         """Выдаёт растущий текст ответа по мере генерации."""
-        ids = self.build_prompt(messages)
+        context = "\n".join([card or ""] + [m["content"] for m in messages])
+        if blocked(context):
+            yield REFUSAL
+            return
+        ids = self.build_prompt(messages, card)
         reply = []
         for t in self.model.generate_stream(torch.tensor([ids]), self.max_new_tokens,
                                             temperature=self.temperature, top_k=self.top_k,
@@ -50,12 +61,16 @@ class ChatBot:
                 break
             reply.append(t)
             # недособранная буква (байты UTF-8) декодируется как «�» — не показываем её
-            yield self.fmt.decode(reply).rstrip("�").strip()
+            text = self.fmt.decode(reply).rstrip("�").strip()
+            if len(reply) % 8 == 0 and blocked(context, text):
+                yield REFUSAL
+                return
+            yield text
 
-    def answer(self, question):
+    def answer(self, question, card=None):
         self.history.append({"role": "user", "content": question})
         text = ""
-        for text in self.stream(self.history):
+        for text in self.stream(self.history, card):
             pass
         self.history.append({"role": "assistant", "content": text})
         return text
@@ -68,11 +83,16 @@ def main():
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top_k", type=int, default=40)
     p.add_argument("--max_new_tokens", type=int, default=150)
+    p.add_argument("--name", help="ролевая игра: имя персонажа")
+    p.add_argument("--persona", help="ролевая игра: описание персонажа")
+    p.add_argument("--scenario", help="ролевая игра: сценарий / место действия")
     args = p.parse_args()
+    card = make_card(args.name or "", args.persona or "", args.scenario or "") \
+        if (args.name or args.persona or args.scenario) else None
 
     bot = ChatBot(args.model, args.temperature, args.top_k, args.max_new_tokens)
     if args.question:
-        print(bot.answer(args.question))
+        print(bot.answer(args.question, card))
         return
     print(f"Модель: {bot.ckpt['config']}, шаг обучения {bot.ckpt.get('iter')}. /new — новый диалог, /exit — выход")
     while True:
@@ -87,7 +107,7 @@ def main():
             print("(диалог забыт)")
             continue
         if q:
-            print("Бот:", bot.answer(q))
+            print("Бот:", bot.answer(q, card))
 
 
 if __name__ == "__main__":
