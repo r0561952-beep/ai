@@ -85,6 +85,16 @@ python train.py --init_from model/model.pt --mix wiki=0.7,qa=0.3 --lr 6e-4 --min
 «Луна — город в Донецкой области». В 14 млн параметров просто не помещаются знания
 из 91 тыс. статей — нужна модель в разы больше и видеокарта.
 
+## Большая модель (~45 млн параметров) на видеокарте
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/r0561952-beep/ai/blob/ccr-d2dd0252-6ksj1l/colab_train.ipynb)
+
+- **Google Colab** (`colab_train.ipynb`) — одна кнопка ▶. 10 частей Википедии + диалоги,
+  7 часов на T4. Прогресс хранится на Google Диске (`ai_training/`): если Colab отключился,
+  снова нажми ▶ — обучение продолжится с места остановки.
+- **Kaggle** (`kaggle/run.py`) — то же самое фоновой задачей (нужен аккаунт с подтверждённым телефоном).
+- В чате (`colab_chat.ipynb`) выбери «большая (с Google Диска)» — можно пробовать и во время обучения.
+
 ## Как сделать её умнее
 
 1. **Видеокарта + модель побольше** — `colab_train.ipynb` или Kaggle (`--preset medium`, ~40 млн параметров).
