@@ -31,7 +31,8 @@ p.add_argument("--batch_size", type=int, default=4)
 p.add_argument("--grad_accum", type=int, default=4)
 p.add_argument("--lr", type=float, default=2e-4)
 p.add_argument("--lora_r", type=int, default=16)
-p.add_argument("--max_minutes", type=float, default=0, help="остановиться через N минут (0 = до конца)")
+p.add_argument("--max_minutes", type=float, default=0, help="остановиться через N минут суммарно (0 = до конца)")
+p.add_argument("--run_minutes", type=float, default=0, help="остановить ЭТОТ запуск через N минут (продолжить — запуском снова)")
 p.add_argument("--save_every", type=int, default=50, help="сохранять прогресс каждые N шагов")
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 args = p.parse_args()
@@ -99,6 +100,14 @@ def main():
     state_path = os.path.join(args.out, "state.pt")
     adapter_dir = os.path.join(args.out, "adapter")
     cuda = args.device.startswith("cuda")
+    torch.set_num_threads(os.cpu_count() or 4)
+    # видеокарта T4: fp16; процессор с AMX/AVX512-BF16: bf16 (в 2-3 раза быстрее fp32); иначе fp32
+    try:
+        cpu_bf16 = not cuda and any(f in open("/proc/cpuinfo").read() for f in ("amx_bf16", "avx512_bf16"))
+    except OSError:
+        cpu_bf16 = False
+    amp = torch.float16 if cuda else (torch.bfloat16 if cpu_bf16 else None)
+    print("точность:", amp or "fp32")
     if cuda:
         print("видеокарта:", torch.cuda.get_device_name(0))
 
@@ -110,7 +119,7 @@ def main():
     print(f"примеров: {len(examples)}, токенов: {n_tok:,}, шагов: {steps_total}")
 
     # fp16 на T4 (bf16 там нет); сама модель заморожена, учатся только веса LoRA (в fp32)
-    dtype = torch.float16 if cuda else torch.float32
+    dtype = amp or torch.float32
     model = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(args.device)
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
@@ -164,7 +173,7 @@ def main():
             g["lr"] = lr_at(step)
         total = 0.0
         for ids, lab, att in groups[step]:
-            with torch.autocast("cuda", dtype=torch.float16, enabled=cuda):
+            with torch.autocast("cuda" if cuda else "cpu", dtype=amp or torch.float32, enabled=amp is not None):
                 out = model(input_ids=ids.to(args.device), attention_mask=att.to(args.device),
                             labels=lab.to(args.device))
             loss = out.loss / len(groups[step])
@@ -186,7 +195,8 @@ def main():
                   f"{el:.1f} мин, осталось ~{left:.0f} мин", flush=True)
         if done % args.save_every == 0 or done == steps_total:
             save(done)
-        if args.max_minutes and minutes_before + el > args.max_minutes and done < steps_total:
+        if done < steps_total and ((args.max_minutes and minutes_before + el > args.max_minutes)
+                                   or (args.run_minutes and el > args.run_minutes)):
             save(done)
             print("лимит времени — прогресс сохранён, запусти снова, чтобы продолжить")
             return
