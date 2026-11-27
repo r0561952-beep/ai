@@ -184,7 +184,7 @@ def evaluate(iters=20):
                     losses.append(fwd(*get_batch(split, name))[1].item())
             out[f"{split}_{name}"] = sum(losses) / len(losses)
             total += w * out[f"{split}_{name}"]
-        out[split] = total
+        out[split] = float(total)
     model.train()
     return out
 
@@ -197,7 +197,7 @@ def lr_at(it):
 
 
 def save(it, val_loss, final=False):
-    meta = {"config": asdict(cfg), "iter": it, "val_loss": val_loss}
+    meta = {"config": asdict(cfg), "iter": int(it), "val_loss": float(val_loss)}
     torch.save({**meta, "model": export_state(model, torch.float32), "optimizer": opt.state_dict()}, full_ckpt)
     if final:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
