@@ -16,7 +16,7 @@ import torch
 from transformers import (AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList,
                           TextIteratorStreamer)
 
-from rp_card import make_card
+from rp_card import finish, make_card
 from safety import REFUSAL, blocked
 
 SYSTEM_DEFAULT = "Ты — живой собеседник в ролевой игре. Отвечай от лица своего персонажа."
@@ -31,7 +31,7 @@ class _StopFlag(StoppingCriteria):
 
 
 class QwenBot:
-    def __init__(self, adapter=None, base="Qwen/Qwen2.5-1.5B", temperature=0.8, top_k=40,
+    def __init__(self, adapter=None, base="Qwen/Qwen2.5-1.5B", temperature=0.6, top_k=40,
                  max_new_tokens=200, max_context=2048):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tok = AutoTokenizer.from_pretrained(base)
@@ -77,7 +77,9 @@ class QwenBot:
                       temperature=max(self.temperature, 1e-3), top_k=self.top_k, top_p=0.95,
                       repetition_penalty=1.1, eos_token_id=self.stop_ids, pad_token_id=self.stop_ids[-1],
                       stopping_criteria=StoppingCriteriaList([flag]))
-        threading.Thread(target=self.model.generate, kwargs=kwargs, daemon=True).start()
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(out=self.model.generate(**kwargs)), daemon=True)
+        worker.start()
         text, pieces = "", 0
         for piece in streamer:
             text += piece
@@ -87,6 +89,11 @@ class QwenBot:
                 yield REFUSAL
                 return
             yield text.strip()
+        worker.join()
+        out = result.get("out")
+        if out is not None and out.shape[1] - inputs["input_ids"].shape[1] >= self.max_new_tokens \
+                and out[0, -1].item() not in self.stop_ids:
+            yield finish(text)  # упёрлись в лимит длины — не обрываем ответ на полуслове
 
     def answer(self, question, card=None):
         self.history.append({"role": "user", "content": question})

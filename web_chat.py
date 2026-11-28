@@ -66,8 +66,8 @@ def build_ui(bot=None):
             gr.Textbox(value=DEFAULT_CHARACTER["name"], label="Персонаж (имя)"),
             gr.Textbox(value=DEFAULT_CHARACTER["persona"], label="Описание: характер, внешность, манера речи", lines=3),
             gr.Textbox(value=DEFAULT_CHARACTER["scenario"], label="Сценарий: где и когда происходит действие", lines=2),
-            gr.Slider(0.1, 1.5, value=0.8, step=0.1, label="Температура (больше — фантазийнее)"),
-            gr.Slider(20, 250, value=150, step=10, label="Максимальная длина ответа (токенов)"),
+            gr.Slider(0.1, 1.5, value=getattr(bot, "temperature", 0.8), step=0.1, label="Температура (больше — фантазийнее)"),
+            gr.Slider(20, 250, value=getattr(bot, "max_new_tokens", 150), step=10, label="Максимальная длина ответа (токенов)"),
         ],
         additional_inputs_accordion=gr.Accordion("🎭 Персонаж и настройки", open=False),
         save_history=True,   # список прошлых чатов, как в ChatGPT (хранится в браузере)

@@ -24,3 +24,27 @@ def make_card(name="", persona="", scenario="", user=""):
     if user:
         lines.append("Собеседник: " + cut(user, CARD_LIMITS["user"]))
     return "\n".join(lines)
+
+
+_END = ".!?…»\")"
+
+
+def finish(text):
+    """Ответ упёрся в лимит длины — убираем недописанное предложение в конце."""
+    t = (text or "").rstrip()
+    best, stars = -1, 0
+    for i, ch in enumerate(t):
+        stars += ch == "*"
+        if ch in _END or (ch == "*" and stars % 2 == 0):  # «*» — только закрывающая звёздочка действия
+            best = i
+    if best == len(t) - 1:
+        return t
+    t = t[:best + 1] if best >= len(t) * 0.4 else t + "…"
+    # закрываем то, что осталось открытым: *действие*, "реплика", «реплика»
+    if t.count("*") % 2:
+        t += "*"
+    if t.count('"') % 2:
+        t += '"'
+    if t.count("«") > t.count("»"):
+        t += "»"
+    return t

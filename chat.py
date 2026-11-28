@@ -17,7 +17,7 @@ import argparse
 import torch
 
 from model import load_model
-from rp_card import make_card
+from rp_card import finish, make_card
 from safety import REFUSAL, blocked
 from tokenizer_utils import ChatFormat, load_tokenizer
 
@@ -59,7 +59,7 @@ class ChatBot:
             yield REFUSAL
             return
         ids = self.build_prompt(messages, card)
-        reply = []
+        reply, text = [], ""
         for t in self.model.generate_stream(torch.tensor([ids]), self.max_new_tokens,
                                             temperature=self.temperature, top_k=self.top_k,
                                             stop_token=self.fmt.end):
@@ -72,6 +72,8 @@ class ChatBot:
                 yield REFUSAL
                 return
             yield text
+        if len(reply) >= self.max_new_tokens:
+            yield finish(text)  # упёрлись в лимит длины — не обрываем ответ на полуслове
 
     def answer(self, question, card=None):
         self.history.append({"role": "user", "content": question})
