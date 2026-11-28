@@ -1,15 +1,18 @@
-"""Чат с Qwen2.5, дообученной на ролевых данных (адаптер LoRA из qwen_train.py).
+"""Чат с Qwen, дообученной на ролевых данных (адаптер LoRA из qwen_train.py).
 
-Нужна видеокарта (на процессоре 1,5 млрд параметров отвечают очень медленно).
+Нужна видеокарта (на процессоре 1,5–2 млрд параметров отвечают очень медленно).
+Базовая модель берётся из настроек адаптера (adapter_config.json).
 
-  python qwen_chat.py --adapter /content/drive/MyDrive/ai_qwen/adapter
-  python web_chat.py --qwen /content/drive/MyDrive/ai_qwen/adapter --share   # веб-чат
+  python qwen_chat.py --adapter model/qwen35_rp_adapter
+  python web_chat.py --qwen model/qwen35_rp_adapter --share   # веб-чат
 
 Из Python:
   from qwen_chat import QwenBot
-  bot = QwenBot("/content/drive/MyDrive/ai_qwen/adapter")
+  bot = QwenBot("model/qwen35_rp_adapter")
 """
 import argparse
+import json
+import os
 import threading
 
 import torch
@@ -20,6 +23,7 @@ from rp_card import finish, make_card
 from safety import REFUSAL, blocked
 
 SYSTEM_DEFAULT = "Ты — живой собеседник в ролевой игре. Отвечай от лица своего персонажа."
+DEFAULT_BASE = "Qwen/Qwen3.5-2B-Base"
 
 
 class _StopFlag(StoppingCriteria):
@@ -31,11 +35,19 @@ class _StopFlag(StoppingCriteria):
 
 
 class QwenBot:
-    def __init__(self, adapter=None, base="Qwen/Qwen2.5-1.5B", temperature=0.6, top_k=40,
+    def __init__(self, adapter=None, base=None, temperature=0.6, top_k=40,
                  max_new_tokens=200, max_context=2048):
+        if base is None:
+            cfg = os.path.join(adapter or "", "adapter_config.json")
+            base = json.load(open(cfg))["base_model_name_or_path"] if adapter and os.path.exists(cfg) else DEFAULT_BASE
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tok = AutoTokenizer.from_pretrained(base)
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        # Qwen3/3.5 умеют «рассуждать» в <think>…</think>; пустой блок — сразу отвечает (так и обучали)
+        self.think = "<think>\n\n</think>\n\n" if "<think>" in self.tok.get_vocab() else ""
+        if self.device == "cuda":  # bf16 — на новых видеокартах, на T4 — fp16
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        else:
+            dtype = torch.float32
         model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(self.device)
         if adapter:
             from peft import PeftModel
@@ -58,12 +70,12 @@ class QwenBot:
         """ChatML как при обучении: карточка -> system. Старые реплики выкидываются,
         если не влезают в окно; карточка остаётся всегда."""
         head = f"<|im_start|>system\n{card or SYSTEM_DEFAULT}<|im_end|>\n"
-        turns = [f"<|im_start|>{'user' if m['role'] == 'user' else 'assistant'}\n{m['content']}<|im_end|>\n"
-                 for m in messages]
+        turns = [f"<|im_start|>user\n{m['content']}<|im_end|>\n" if m["role"] == "user"
+                 else f"<|im_start|>assistant\n{self.think}{m['content']}<|im_end|>\n" for m in messages]
         budget = self.max_context - self.max_new_tokens - len(self.tok(head).input_ids)
         while len(turns) > 1 and len(self.tok("".join(turns)).input_ids) > budget:
             turns.pop(0)
-        return head + "".join(turns) + "<|im_start|>assistant\n"
+        return head + "".join(turns) + "<|im_start|>assistant\n" + self.think
 
     def stream(self, messages, card=None):
         context = "\n".join([card or ""] + [m["content"] for m in messages])
@@ -107,7 +119,7 @@ class QwenBot:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--adapter", help="папка с адаптером LoRA (из qwen_train.py)")
-    p.add_argument("--base", default="Qwen/Qwen2.5-1.5B")
+    p.add_argument("--base", help="базовая модель (по умолчанию — из настроек адаптера)")
     p.add_argument("-q", "--question")
     p.add_argument("--name")
     p.add_argument("--persona")
